@@ -20,10 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
 	"github.com/cloudwego/localsession/backup"
@@ -51,6 +53,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
+	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/pkg/streaming"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/pkg/warmup"
@@ -472,14 +475,112 @@ func (kc *kClient) richRemoteOption() {
 	}
 }
 
+type mwCostTracker struct {
+	nextCost time.Duration
+}
+
+func measureMiddleware(mw endpoint.Middleware) endpoint.Middleware {
+	if mw == nil {
+		return nil
+	}
+	name := runtime.FuncForPC(reflect.ValueOf(mw).Pointer()).Name()
+	key := new(int)
+	return func(next endpoint.Endpoint) endpoint.Endpoint {
+		wrappedNext := func(ctx context.Context, req, resp interface{}) error {
+			startNext := time.Now()
+			err := next(ctx, req, resp)
+			if tracker, ok := ctx.Value(key).(*mwCostTracker); ok {
+				tracker.nextCost += time.Since(startNext)
+			}
+			return err
+		}
+		actualEp := mw(wrappedNext)
+		if actualEp == nil {
+			return nil
+		}
+		return func(ctx context.Context, req, resp interface{}) error {
+			tracker := &mwCostTracker{}
+			ctx = context.WithValue(ctx, key, tracker)
+			start := time.Now()
+			err := actualEp(ctx, req, resp)
+			totalCost := time.Since(start)
+			selfCost := totalCost - tracker.nextCost
+			if selfCost > 50*time.Millisecond {
+				klog.CtxWarnf(ctx, "KITEX: Middleware [%s] self cost: %v (total: %v, next: %v)", name, selfCost, totalCost, tracker.nextCost)
+			}
+			return err
+		}
+	}
+}
+
+func measureUnaryMiddleware(mw endpoint.UnaryMiddleware) endpoint.UnaryMiddleware {
+	if mw == nil {
+		return nil
+	}
+	name := runtime.FuncForPC(reflect.ValueOf(mw).Pointer()).Name()
+	key := new(int)
+	return func(next endpoint.UnaryEndpoint) endpoint.UnaryEndpoint {
+		wrappedNext := func(ctx context.Context, req, resp interface{}) error {
+			startNext := time.Now()
+			err := next(ctx, req, resp)
+			if tracker, ok := ctx.Value(key).(*mwCostTracker); ok {
+				tracker.nextCost += time.Since(startNext)
+			}
+			return err
+		}
+		actualEp := mw(wrappedNext)
+		if actualEp == nil {
+			return nil
+		}
+		return func(ctx context.Context, req, resp interface{}) error {
+			tracker := &mwCostTracker{}
+			ctx = context.WithValue(ctx, key, tracker)
+			start := time.Now()
+			err := actualEp(ctx, req, resp)
+			totalCost := time.Since(start)
+			selfCost := totalCost - tracker.nextCost
+			if selfCost > 50*time.Millisecond {
+				klog.CtxWarnf(ctx, "KITEX: UnaryMiddleware [%s] self cost: %v (total: %v, next: %v)", name, selfCost, totalCost, tracker.nextCost)
+			}
+			return err
+		}
+	}
+}
+
 func (kc *kClient) buildInvokeChain(mw middleware) error {
 	innerHandlerEp, err := kc.invokeHandleEndpoint()
 	if err != nil {
 		return err
 	}
-	eps := endpoint.Chain(mw.mws...)(innerHandlerEp)
 
-	kc.eps = endpoint.UnaryChain(mw.uMws...)(func(ctx context.Context, req, resp interface{}) (err error) {
+	measuredMws := make([]endpoint.Middleware, len(mw.mws))
+	for i, m := range mw.mws {
+		measuredMws[i] = measureMiddleware(m)
+	}
+
+	measuredUMws := make([]endpoint.UnaryMiddleware, len(mw.uMws))
+	for i, m := range mw.uMws {
+		measuredUMws[i] = measureUnaryMiddleware(m)
+	}
+
+	measureMw := func(next endpoint.Endpoint) endpoint.Endpoint {
+		return func(ctx context.Context, req, resp interface{}) error {
+			ri := rpcinfo.GetRPCInfo(ctx)
+			rpcStart := ri.Stats().GetEvent(stats.RPCStart)
+			if rpcStart != nil {
+				cost := time.Since(rpcStart.Time())
+				if cost > 50*time.Millisecond {
+					klog.CtxWarnf(ctx, "KITEX: Middlewares execution cost too high: %v, service: %s, method: %s", cost, ri.To().ServiceName(), ri.To().Method())
+				}
+			}
+
+			return next(ctx, req, resp)
+		}
+	}
+
+	eps := endpoint.Chain(measuredMws...)(measureMw(innerHandlerEp))
+
+	kc.eps = endpoint.UnaryChain(measuredUMws...)(func(ctx context.Context, req, resp interface{}) (err error) {
 		return eps(ctx, req, resp)
 	})
 

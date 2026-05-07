@@ -102,7 +102,12 @@ func newResolveMWBuilder(lbf *lbcache.BalancerFactory) endpoint.MiddlewareBuilde
 				if remote.GetInstance() != nil {
 					return next(ctx, request, response)
 				}
+
+				startResolve := time.Now()
 				lb, err := lbf.Get(ctx, dest)
+				if resolveCost := time.Since(startResolve); resolveCost > 50*time.Millisecond {
+					klog.CtxWarnf(ctx, "KITEX: service discovery cost too high: %v, service: %s, method: %s", resolveCost, dest.ServiceName(), dest.Method())
+				}
 				if err != nil {
 					return kerrors.ErrServiceDiscovery.WithCause(err)
 				}
@@ -117,8 +122,13 @@ func newResolveMWBuilder(lbf *lbcache.BalancerFactory) endpoint.MiddlewareBuilde
 
 					// we always need to get a new picker every time, because when downstream update deployment,
 					// we may get an old picker that include all outdated instances which will cause connect always failed.
+					startPick := time.Now()
 					picker := lb.GetPicker()
 					ins := picker.Next(ctx, request)
+					if pickCost := time.Since(startPick); pickCost > 50*time.Millisecond {
+						klog.CtxWarnf(ctx, "KITEX: loadbalance pick cost too high: %v, service: %s, method: %s", pickCost, dest.ServiceName(), dest.Method())
+					}
+
 					if ins == nil {
 						err = kerrors.ErrNoMoreInstance.WithCause(fmt.Errorf("last error: %w", lastErr))
 					} else {
