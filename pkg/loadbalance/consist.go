@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/cloudwego/kitex/pkg/discovery"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
 
@@ -249,6 +250,7 @@ func (cb *consistBalancer) GetPicker(e discovery.Result) Picker {
 	if e.Cacheable {
 		cii, ok := cb.cachedConsistInfo.Load(e.CacheKey)
 		if !ok {
+			klog.Warnf("KITEX: newConsistInfo executed due to cache miss, nodes count: %d", len(e.Instances))
 			cii, _, _ = cb.sfg.Do(e.CacheKey, func() (interface{}, error) {
 				return cb.newConsistInfo(e), nil
 			})
@@ -256,6 +258,7 @@ func (cb *consistBalancer) GetPicker(e discovery.Result) Picker {
 		}
 		ci = cii.(*consistInfo)
 	} else {
+		klog.Warnf("KITEX: newConsistInfo executed due to non-cacheable, nodes count: %d", len(e.Instances))
 		ci = cb.newConsistInfo(e)
 	}
 	picker := consistPickerPool.Get().(*consistPicker)
@@ -265,6 +268,10 @@ func (cb *consistBalancer) GetPicker(e discovery.Result) Picker {
 }
 
 func (cb *consistBalancer) newConsistInfo(e discovery.Result) *consistInfo {
+	start := time.Now()
+	defer func() {
+		klog.Warnf("KITEX: newConsistInfo executed, build hash ring cost: %v, nodes count: %d", time.Since(start), len(e.Instances))
+	}()
 	ci := &consistInfo{}
 	ci.realNodes, ci.virtualNodes = cb.buildNodes(e.Instances)
 	return ci
