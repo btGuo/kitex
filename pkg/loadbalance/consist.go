@@ -250,7 +250,7 @@ func (cb *consistBalancer) GetPicker(e discovery.Result) Picker {
 	if e.Cacheable {
 		cii, ok := cb.cachedConsistInfo.Load(e.CacheKey)
 		if !ok {
-			klog.Warnf("KITEX: newConsistInfo executed due to cache miss, nodes count: %d", len(e.Instances))
+			klog.Warnf("KITEX: newConsistInfo executed due to cache miss, nodes count: %d, key: %s", len(e.Instances), e.CacheKey)
 			cii, _, _ = cb.sfg.Do(e.CacheKey, func() (interface{}, error) {
 				return cb.newConsistInfo(e), nil
 			})
